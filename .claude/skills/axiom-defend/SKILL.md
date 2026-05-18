@@ -14,16 +14,19 @@ Every design decision flows from this assumption.
  
 ---
 
-## Scope Assessment (Run First)
+## Scope Assessment
 
-Before applying the full defensive protocol, assess the complexity of the request:
+Not all requests that touch this skill's domain require the same depth of analysis.
+Apply the protocol proportionally:
 
-- **Simple requests** — one-liner fixes, quick debug, minor utility snippets:
-  apply naming and type hint rules only. Skip the full checklist.
-- **Design-level requests** — pipelines, training loops, data splits, new modules,
-  loss computation: apply the full defensive protocol below.
+- **Targeted fixes** — correcting a single off-by-one, adding a missing `.zero_grad()`,
+  fixing a variable name in existing pipeline code: apply only the Core Mandate directly
+  relevant to the bug (e.g., Mandate 4 for a device issue, Mandate 2 for a shape mismatch).
+  Skip the full checklist.
+- **New components** — new pipeline functions, training loops, data splits, loss computations,
+  new modules: apply the full protocol. All mandates. All guards.
 
-When in doubt, apply the full protocol.
+**Default: when in doubt, apply the full protocol.**
 
 ---
  
