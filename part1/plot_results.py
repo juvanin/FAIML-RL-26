@@ -77,6 +77,35 @@ def smooth(values, window=50):
     return np.convolve(padded, kernel, mode='valid')
 
 
+def select_configs(hp_groups, best_config_only, final_eval_checkpoints):
+    """Return the list of (hp_tag, seed_dirs) to plot for one algorithm.
+
+    When best_config_only is True, scores each HP config by the mean of
+    each seed's final `final_eval_checkpoints` eval returns and returns
+    only the winner. Falls back to all configs if no eval data exists.
+    """
+    if not best_config_only:
+        return sorted(hp_groups.items())
+
+    best_tag, best_score = None, -float('inf')
+    for hp_tag, sds in sorted(hp_groups.items()):
+        scores = []
+        for sd in sds:
+            eval_path = os.path.join(sd, 'eval_log.csv')
+            if not os.path.exists(eval_path):
+                continue
+            data = load_csv(eval_path)
+            vals = np.array(data.get('eval_mean_return', []), dtype=float)
+            if len(vals) == 0:
+                continue
+            n = min(final_eval_checkpoints, len(vals))
+            scores.append(float(np.nanmean(vals[-n:])))
+        if scores and np.mean(scores) > best_score:
+            best_score, best_tag = float(np.mean(scores)), hp_tag
+
+    return [(best_tag, hp_groups[best_tag])] if best_tag else sorted(hp_groups.items())
+
+
 # ------------------------------------------------------------------
 #  Main
 # ------------------------------------------------------------------
@@ -94,92 +123,82 @@ def main():
                                  'ac_mc', 'ac_td'],
                         help='Algorithms to include in the plots')
     parser.add_argument('--conv-threshold', type=float, default=100.0,
-                        help='Return threshold to consider as converged')
+                        help='Eval return threshold to count as converged')
+    parser.add_argument('--best-config-only', dest='best_config_only',
+                        action='store_true', default=True,
+                        help='Plot only the best HP config per algorithm (default: on)')
+    parser.add_argument('--all-configs', dest='best_config_only',
+                        action='store_false',
+                        help='Plot every HP config (disables --best-config-only)')
+    parser.add_argument('--final-eval-checkpoints', type=int, default=10,
+                        help='Trailing eval checkpoints used to score HP configs '
+                             'and compute the summary table final-eval mean')
     args = parser.parse_args()
 
     plot_dir = os.path.join(args.results_dir, 'plots')
     os.makedirs(plot_dir, exist_ok=True)
 
-    # ==================================================================
-    #  1.  Learning curves  (training return vs. episode)
-    # ==================================================================
-    fig, ax = plt.subplots(figsize=(12, 7))
-    summary_rows = []
-
-    cmap = plt.get_cmap('tab20')
-    color_idx = 0
-
+    # ── One-time HP selection per algorithm ───────────────────────────────
+    # Both plots and the summary table iterate over `algo_configs` so they
+    # are guaranteed to show the same curves.
+    algo_configs = {}  # algo → [(hp_tag, [seed_dirs])]
     for algo in args.algorithms:
-        # Support both old layout (algo/seed_*) and new layout (algo/lr*_upd*/seed_*)
         seed_dirs = sorted(
             glob.glob(os.path.join(args.results_dir, algo, 'lr*_upd*', 'seed_*')) +
             glob.glob(os.path.join(args.results_dir, algo, 'seed_*')))
         if not seed_dirs:
             print(f"[skip] no data for '{algo}'")
             continue
-
-        # Group by hp config: one curve per (algo, lr, upd)
         hp_groups = {}
         for sd in seed_dirs:
             hp_tag = os.path.basename(os.path.dirname(sd))
             hp_groups.setdefault(hp_tag, []).append(sd)
+        algo_configs[algo] = select_configs(
+            hp_groups, args.best_config_only, args.final_eval_checkpoints)
+        if args.best_config_only and algo_configs[algo]:
+            print(f"[best-HP] {algo}: {algo_configs[algo][0][0]}")
 
-        for hp_tag, hp_seed_dirs in sorted(hp_groups.items()):
-            base_label = LABELS.get(algo, algo)
-            label = f'{base_label} [{hp_tag}]' if hp_tag != algo else base_label
-            color = COLORS.get(algo, cmap(color_idx / 20))
-            color_idx += 1
+    def _label(algo, hp_tag, n_configs):
+        base = LABELS.get(algo, algo)
+        return f'{base} [{hp_tag}]' if n_configs > 1 else base
 
+    # ==================================================================
+    #  1.  Learning curves  (smoothed training return vs. episode)
+    # ==================================================================
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    for algo in args.algorithms:
+        if algo not in algo_configs:
+            continue
+        color = COLORS.get(algo, '#555555')
+        configs = algo_configs[algo]
+        for hp_tag, hp_seed_dirs in configs:
+            label = _label(algo, hp_tag, len(configs))
             all_returns = []
-            wall_times = []
             for sd in hp_seed_dirs:
                 log_path = os.path.join(sd, 'log.csv')
                 if not os.path.exists(log_path):
                     continue
                 data = load_csv(log_path)
-                returns = np.array(data['return'], dtype=float)
-                all_returns.append(returns)
-                wt = [x for x in data.get('wall_time', []) if not np.isnan(x)]
-                if wt:
-                    wall_times.append(wt[-1])
-
+                all_returns.append(np.array(data['return'], dtype=float))
             if not all_returns:
                 continue
-
             min_len = min(len(r) for r in all_returns)
             all_returns = np.array([r[:min_len] for r in all_returns])
             smoothed = np.array([smooth(r, args.window) for r in all_returns])
-            mean_curve = smoothed.mean(axis=0)
-            std_curve = smoothed.std(axis=0)
             episodes = np.arange(1, min_len + 1)
+            mean_c = smoothed.mean(axis=0)
+            std_c = smoothed.std(axis=0)
+            ax.plot(episodes, mean_c, color=color, label=label, linewidth=2)
+            ax.fill_between(episodes, mean_c - std_c, mean_c + std_c,
+                            color=color, alpha=0.15)
 
-            ax.plot(episodes, mean_curve, color=color, label=label, linewidth=2)
-            ax.fill_between(episodes, mean_curve - std_curve,
-                            mean_curve + std_curve, color=color, alpha=0.15)
-
-            mean_returns = all_returns.mean(axis=0)
-            mean100 = mean_returns[-100:].mean()
-            std100  = mean_returns[-100:].std()
-            mean500 = mean_returns[-500:].mean() if len(mean_returns) >= 500 else mean_returns.mean()
-            std500  = mean_returns[-500:].std()  if len(mean_returns) >= 500 else mean_returns.std()
-            rolling = smooth(mean_returns, args.window)
-            conv_ep = (int(np.argmax(rolling > args.conv_threshold) + 1)
-                       if np.any(rolling > args.conv_threshold) else None)
-            avg_wall = float(np.mean(wall_times)) if wall_times else None
-
-            summary_rows.append({
-                'Algorithm': label,
-                'Mean (last 100)': f'{mean100:.1f}',
-                'Std (last 100)':  f'{std100:.1f}',
-                'Mean (last 500)': f'{mean500:.1f}',
-                'Std (last 500)':  f'{std500:.1f}',
-                f'Convergence Ep (>{args.conv_threshold:g})': str(conv_ep) if conv_ep else 'N/A',
-                'Wall Time (s)': f'{avg_wall:.0f}' if avg_wall else 'N/A',
-            })
-
+    title1 = 'Hopper-v4: Training Curves'
+    if args.best_config_only:
+        title1 += ' (best HP per algorithm)'
     ax.set_xlabel('Episode', fontsize=13)
     ax.set_ylabel('Episode Return (smoothed)', fontsize=13)
-    ax.set_title('Hopper-v4: Learning Curves', fontsize=15)
+    ax.set_title(title1, fontsize=15)
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -189,29 +208,20 @@ def main():
     plt.close(fig)
 
     # ==================================================================
-    #  2.  Evaluation curves  (eval mean return vs. episode checkpoint)
+    #  2.  Evaluation curves  (deterministic eval return vs. episode)
+    #      Summary table data is collected here so both use the same runs.
     # ==================================================================
     fig2, ax2 = plt.subplots(figsize=(12, 7))
     has_eval = False
+    summary_rows = []
 
-    eval_color_idx = 0
     for algo in args.algorithms:
-        seed_dirs = sorted(
-            glob.glob(os.path.join(args.results_dir, algo, 'lr*_upd*', 'seed_*')) +
-            glob.glob(os.path.join(args.results_dir, algo, 'seed_*')))
-        if not seed_dirs:
+        if algo not in algo_configs:
             continue
-
-        hp_groups = {}
-        for sd in seed_dirs:
-            hp_tag = os.path.basename(os.path.dirname(sd))
-            hp_groups.setdefault(hp_tag, []).append(sd)
-
-        for hp_tag, hp_seed_dirs in sorted(hp_groups.items()):
-            base_label = LABELS.get(algo, algo)
-            label = f'{base_label} [{hp_tag}]' if hp_tag != algo else base_label
-            color = COLORS.get(algo, cmap(eval_color_idx / 20))
-            eval_color_idx += 1
+        color = COLORS.get(algo, '#555555')
+        configs = algo_configs[algo]
+        for hp_tag, hp_seed_dirs in configs:
+            label = _label(algo, hp_tag, len(configs))
 
             all_eval_returns, all_eval_eps = [], []
             for sd in hp_seed_dirs:
@@ -224,7 +234,6 @@ def main():
                         np.array(data['eval_mean_return'], dtype=float))
                     all_eval_eps.append(
                         np.array(data['episode_checkpoint'], dtype=float))
-
             if not all_eval_returns:
                 continue
 
@@ -232,7 +241,6 @@ def main():
             min_len = min(len(r) for r in all_eval_returns)
             eval_returns = np.array([r[:min_len] for r in all_eval_returns])
             eval_eps = all_eval_eps[0][:min_len]
-
             mean_eval = eval_returns.mean(axis=0)
             std_eval = eval_returns.std(axis=0)
 
@@ -241,10 +249,55 @@ def main():
             ax2.fill_between(eval_eps, mean_eval - std_eval,
                              mean_eval + std_eval, color=color, alpha=0.15)
 
+            # ── Summary table row (eval-based, not training return) ────
+            n_f = min(args.final_eval_checkpoints, len(mean_eval))
+            # Cross-seed final: each seed's mean over the last n_f checkpoints
+            per_seed_final = [float(r[-n_f:].mean()) for r in eval_returns]
+            final_mean = float(np.mean(per_seed_final))
+            cross_seed_std = (float(np.std(per_seed_final, ddof=1))
+                              if len(per_seed_final) > 1 else 0.0)
+
+            # Peak: best 3-checkpoint rolling mean of the seed-averaged curve
+            if len(mean_eval) >= 3:
+                rolling = np.convolve(mean_eval, np.ones(3) / 3, mode='valid')
+                pk_i = int(np.argmax(rolling))
+                peak_val = float(rolling[pk_i])
+                peak_ep = int(eval_eps[pk_i + 1])  # window centre
+            else:
+                pk_i = int(np.argmax(mean_eval))
+                peak_val = float(mean_eval[pk_i])
+                peak_ep = int(eval_eps[pk_i])
+
+            # Convergence: first eval ep where 3-pt window >= threshold
+            conv_ep = None
+            for i in range(1, len(mean_eval) - 1):
+                if np.all(mean_eval[i - 1: i + 2] >= args.conv_threshold):
+                    conv_ep = int(eval_eps[i])
+                    break
+            if conv_ep is None:  # fallback for short curves (< 3 pts)
+                for ep, v in zip(eval_eps, mean_eval):
+                    if v >= args.conv_threshold:
+                        conv_ep = int(ep)
+                        break
+
+            summary_rows.append({
+                'Algorithm': label,
+                'N seeds': str(len(per_seed_final)),
+                'Final eval mean': f'{final_mean:.1f}',
+                'Cross-seed std': f'{cross_seed_std:.1f}',
+                'Peak eval mean': f'{peak_val:.1f}',
+                'Peak episode': str(peak_ep),
+                f'Conv ep (>{args.conv_threshold:.0f})': (
+                    str(conv_ep) if conv_ep else 'N/A'),
+            })
+
     if has_eval:
+        title2 = 'Hopper-v4: Evaluation Curves'
+        if args.best_config_only:
+            title2 += ' (best HP per algorithm)'
         ax2.set_xlabel('Episode', fontsize=13)
         ax2.set_ylabel('Eval Mean Return', fontsize=13)
-        ax2.set_title('Hopper-v4: Evaluation Curves', fontsize=15)
+        ax2.set_title(title2, fontsize=15)
         ax2.legend(fontsize=11)
         ax2.grid(True, alpha=0.3)
         fig2.tight_layout()
@@ -254,11 +307,11 @@ def main():
     plt.close(fig2)
 
     # ==================================================================
-    #  3.  Summary table (printed to console)
+    #  3.  Summary table — eval return (printed to console)
     # ==================================================================
     if summary_rows:
         print(f"\n{'='*80}")
-        print("SUMMARY TABLE")
+        print("SUMMARY TABLE  (deterministic eval return)")
         print(f"{'='*80}")
         headers = list(summary_rows[0].keys())
         widths = {h: max(len(h), max(len(r[h]) for r in summary_rows))
@@ -267,8 +320,7 @@ def main():
         print(hdr)
         print('-' * len(hdr))
         for row in summary_rows:
-            print(' | '.join(
-                str(row[h]).ljust(widths[h]) for h in headers))
+            print(' | '.join(str(row[h]).ljust(widths[h]) for h in headers))
         print()
 
 

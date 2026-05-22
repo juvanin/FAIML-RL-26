@@ -27,6 +27,21 @@ sys.path.insert(0, os.path.abspath(_part2_dir))
 # Part 1 helpers
 # ---------------------------------------------------------------------------
 
+def _resolve_checkpoint(path, prefer_best):
+    """Resolve the actual checkpoint file to load.
+
+    If `prefer_best` is True and `model_best.pt` exists in the same directory
+    as `path`, return that instead. Falls back silently to `path` if not found.
+    """
+    if not prefer_best:
+        return path
+    candidate = os.path.join(os.path.dirname(os.path.abspath(path)), 'model_best.pt')
+    if os.path.exists(candidate):
+        print(f"[render] Using model_best.pt (pass --no-best to use {os.path.basename(path)})")
+        return candidate
+    return path
+
+
 def _load_part1(checkpoint_path):
     import torch
     from agent import Policy, Agent
@@ -37,8 +52,12 @@ def _load_part1(checkpoint_path):
     algorithm = checkpoint['algorithm']
     trained_ep = checkpoint.get('episode', '?')
 
+    extra = ''
+    if 'smoothed_eval' in checkpoint:
+        extra = (f", smoothed_eval={checkpoint['smoothed_eval']:.1f}"
+                 f", raw_eval={checkpoint['raw_eval']:.1f}")
     print(f"[Part1] Loaded: algorithm={algorithm}, "
-          f"trained_episodes={trained_ep}, obs_dim={obs_dim}, act_dim={act_dim}")
+          f"trained_episodes={trained_ep}, obs_dim={obs_dim}, act_dim={act_dim}{extra}")
 
     policy = Policy(obs_dim, act_dim)
     policy.load_state_dict(checkpoint['policy_state_dict'])
@@ -91,7 +110,8 @@ def _run_part1_episodes(agent, env, n_episodes, seed, slow, render):
 
 
 def run_part1(args, checkpoint_path=None, suppress_print=False):
-    path = checkpoint_path or args.checkpoint
+    raw_path = checkpoint_path or args.checkpoint
+    path = _resolve_checkpoint(raw_path, getattr(args, 'use_best', True))
     agent, meta = _load_part1(path)
 
     render = args.render and not args.save_video
@@ -269,6 +289,10 @@ def parse_args():
                         help='Second checkpoint for side-by-side text comparison')
     parser.add_argument('--slow', action='store_true',
                         help='Add ~33ms delay between frames for slower playback')
+    parser.add_argument('--use-best', dest='use_best', action='store_true', default=True,
+                        help='Load model_best.pt from the same directory if it exists (default: on)')
+    parser.add_argument('--no-best', dest='use_best', action='store_false',
+                        help='Load exactly the specified checkpoint, ignoring model_best.pt')
     return parser.parse_args()
 
 

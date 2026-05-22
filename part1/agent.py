@@ -15,6 +15,20 @@ def discount_rewards(r, gamma, done=None):
     return discounted_r
 
 
+def _standardize(advantage, eps=1e-8):
+    """Zero-mean, unit-variance advantage.
+
+    Falls back to mean-centring when the batch has near-zero variance
+    (e.g. single-step rollouts early in training) — dividing by a tiny std
+    would otherwise blow the gradient up.
+    """
+    mean = advantage.mean()
+    std = advantage.std()
+    if std < eps:
+        return advantage - mean
+    return (advantage - mean) / (std + eps)
+
+
 VALID_ALGORITHMS = ['reinforce', 'reinforce_batch', 'reinforce_ema', 'reinforce_fixed', 'ac_mc', 'ac_td']
 
 
@@ -123,8 +137,12 @@ class Agent(object):
             self.critic_optimizer = torch.optim.Adam(
                 policy.critic_parameters(), lr=critic_lr)
 
-        # EMA baseline state (used only by reinforce_ema)
-        self.ema_baseline = 0.0
+        # EMA baseline state (used only by reinforce_ema).
+        # None sentinel triggers lazy init to G.mean() on the first update —
+        # avoids the cold-start where advantage = G - 0 in the first few
+        # episodes (returns 1-5 vs baseline 0 = no variance reduction when
+        # it matters most).
+        self._ema_baseline = None
         self.ema_alpha = ema_alpha
 
         # Fixed baseline (used only by reinforce_fixed)
@@ -137,6 +155,21 @@ class Agent(object):
         self.done = []          # MDP termination only (for TD bootstrap)
         self.episode_done = []  # episode boundary: terminated OR truncated
                                 # (for discount_rewards return reset)
+
+
+    @property
+    def ema_baseline(self):
+        """Read-only accessor (None until the first reinforce_ema update)."""
+        return self._ema_baseline
+
+    def _update_ema(self, g_mean):
+        """Update EMA baseline; lazy-init to g_mean on the first call."""
+        if self._ema_baseline is None:
+            self._ema_baseline = g_mean
+        else:
+            self._ema_baseline = ((1 - self.ema_alpha) * self._ema_baseline
+                                  + self.ema_alpha * g_mean)
+        return self._ema_baseline
 
 
     def update_policy(self):
@@ -221,11 +254,9 @@ class Agent(object):
         """REINFORCE + EMA constant baseline (tracks discounted-return mean)."""
         G = discount_rewards(rewards, self.gamma, done)
 
-        # Update EMA baseline with the mean of *discounted* returns
-        self.ema_baseline = ((1 - self.ema_alpha) * self.ema_baseline
-                             + self.ema_alpha * G.mean().item())
-
-        advantage = G - self.ema_baseline
+        # Lazy init on first call; standard EMA thereafter.
+        baseline = self._update_ema(G.mean().item())
+        advantage = G - baseline
 
         actor_loss = -(action_log_probs * advantage).mean()
 
@@ -237,7 +268,7 @@ class Agent(object):
         return {
             'actor_loss': actor_loss.item(),
             'critic_loss': None,
-            'baseline': self.ema_baseline,
+            'baseline': baseline,
             'mean_value': None,
             'mean_td_error': None,
         }
@@ -271,10 +302,10 @@ class Agent(object):
         G = discount_rewards(rewards, self.gamma, done)
         values = self.policy.critic_forward(states)
 
-        # Advantage — detach so actor update only touches actor params
-        advantage = (G - values).detach()
-        # Standardize advantage for actor loss only (critic target G stays raw)
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        # Advantage — detach so actor update only touches actor params.
+        # Standardize for actor loss only (critic target G stays raw); the
+        # _standardize helper falls back to mean-centring when std≈0.
+        advantage = _standardize((G - values).detach())
 
         # Critic update: push V(s) toward Monte-Carlo return G
         critic_loss = F.mse_loss(values, G)
@@ -309,10 +340,11 @@ class Agent(object):
         # both sides of the MSE (constraint #8)
         td_target = rewards + self.gamma * next_values.detach() * (1 - done)
 
-        # Advantage — detach so actor update only touches actor params
-        advantage = (td_target - values).detach()
-        # Standardize advantage for actor loss only (critic target td_target stays raw)
-        advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        # Advantage — detach so actor update only touches actor params.
+        # Standardize for actor loss only (critic target td_target stays raw);
+        # the _standardize helper falls back to mean-centring when std≈0.
+        advantage_raw = (td_target - values).detach()
+        advantage = _standardize(advantage_raw)
 
         # Critic update: push V(s) toward TD target
         critic_loss = F.mse_loss(values, td_target)
@@ -333,7 +365,9 @@ class Agent(object):
             'critic_loss': critic_loss.item(),
             'baseline': None,
             'mean_value': values.mean().item(),
-            'mean_td_error': advantage.mean().item(),
+            # Log the pre-standardization TD error — the standardized one is
+            # ~0 by construction and uninformative.
+            'mean_td_error': advantage_raw.mean().item(),
         }
 
 

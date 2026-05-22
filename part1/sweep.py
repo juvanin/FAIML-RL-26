@@ -39,7 +39,7 @@ import numpy as np
 LR_VALUES     = [1e-4, 1e-3, 1e-2]
 UPDATE_VALUES = [1,5]
 SEEDS         = [1,2,3,4,5]
-EPISODES      = 3000
+EPISODES      = 2000
 _HERE         = os.path.dirname(os.path.abspath(__file__))
 RESULTS_DIR   = os.path.join(_HERE, 'results')
 

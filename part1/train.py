@@ -53,6 +53,113 @@ def evaluate_agent(agent, env_name, num_episodes, base_seed):
 
 
 # ------------------------------------------------------------------
+#  Best-checkpoint helpers
+# ------------------------------------------------------------------
+
+def _smoothed_eval_max(eval_means, eval_eps, window=5):
+    """Max of a centred moving-average over the eval curve.
+
+    Returns (smoothed_best_value, episode_of_smoothed_best). Falls back to
+    raw max when fewer than `window` checkpoints exist. This is the signal
+    used for `model_best.pt` saves — guards against checkpointing a single
+    lucky 10-rollout eval spike.
+    """
+    n = len(eval_means)
+    if n == 0:
+        return None, None
+    arr = np.asarray(eval_means, dtype=float)
+    eps = np.asarray(eval_eps, dtype=int)
+    if n < window:
+        idx = int(np.argmax(arr))
+        return float(arr[idx]), int(eps[idx])
+    smoothed = np.convolve(arr, np.ones(window) / window, mode='valid')
+    idx = int(np.argmax(smoothed))
+    # Centre the reported episode on the window
+    return float(smoothed[idx]), int(eps[idx + window // 2])
+
+
+def _topk_eval_mean(eval_means, k=5):
+    """Mean of the top-K eval checkpoints — less biased than single max."""
+    if not eval_means:
+        return None
+    k = min(k, len(eval_means))
+    return float(np.sort(np.asarray(eval_means, dtype=float))[-k:].mean())
+
+
+def write_seed_summary(out_dir, eval_means, eval_eps, total_episodes,
+                       wall_time_s, smooth_window=5, topk=5, final_k=5):
+    """Write per-seed summary.json with raw / smoothed / top-K / final-K stats."""
+    if not eval_means:
+        summary = {
+            'total_episodes': total_episodes,
+            'wall_time_s': round(wall_time_s, 1),
+            'n_eval_checkpoints': 0,
+            'best_eval_mean': None, 'best_eval_episode': None,
+            'smoothed_best_eval': None, 'smoothed_best_episode': None,
+            'topk_eval_mean': None, 'topk_k': topk,
+            'final_eval_mean': None, 'final_k': final_k,
+            'smoothing_window': smooth_window,
+        }
+    else:
+        arr = np.asarray(eval_means, dtype=float)
+        raw_idx = int(np.argmax(arr))
+        smoothed_best, smoothed_ep = _smoothed_eval_max(
+            eval_means, eval_eps, window=smooth_window)
+        fk = min(final_k, len(arr))
+        summary = {
+            'total_episodes': total_episodes,
+            'wall_time_s': round(wall_time_s, 1),
+            'n_eval_checkpoints': len(arr),
+            'best_eval_mean': round(float(arr[raw_idx]), 2),
+            'best_eval_episode': int(eval_eps[raw_idx]),
+            'smoothed_best_eval': (round(smoothed_best, 2)
+                                   if smoothed_best is not None else None),
+            'smoothed_best_episode': smoothed_ep,
+            'smoothing_window': smooth_window,
+            'topk_eval_mean': round(_topk_eval_mean(eval_means, topk), 2),
+            'topk_k': topk,
+            'final_eval_mean': round(float(arr[-fk:].mean()), 2),
+            'final_k': fk,
+        }
+    with open(os.path.join(out_dir, 'summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    return summary
+
+
+# ------------------------------------------------------------------
+#  LR schedule helper
+# ------------------------------------------------------------------
+
+def make_schedulers(actor_optimizer, critic_optimizer, schedule, total_updates):
+    """Return (actor_sched, critic_sched) or (None, None) for 'none'.
+
+    Both schedules decay to 10% of initial LR over `total_updates` steps,
+    matched on the same floor so the two are directly comparable.
+
+    Decay is per-update-call (= per episode when update_every=1), NOT per
+    env-step. Variable-length episodes mean early (short) episodes consume
+    the same decay budget as late (long) ones — flag this in the writeup.
+    """
+    if schedule == 'none' or total_updates <= 0:
+        return None, None
+
+    def _make(opt):
+        if opt is None:
+            return None
+        if schedule == 'linear':
+            return torch.optim.lr_scheduler.LinearLR(
+                opt, start_factor=1.0, end_factor=0.1,
+                total_iters=total_updates)
+        if schedule == 'cosine':
+            base_lr = opt.param_groups[0]['lr']
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=total_updates, eta_min=base_lr * 0.1)
+        raise ValueError(f'Unknown lr_schedule: {schedule!r}')
+
+    return _make(actor_optimizer), _make(critic_optimizer)
+
+
+# ------------------------------------------------------------------
 #  Main
 # ------------------------------------------------------------------
 
@@ -62,13 +169,13 @@ def main():
     parser.add_argument('--algorithm', type=str, default='reinforce',
                         choices=VALID_ALGORITHMS,
                         help='Policy-gradient variant to train')
-    parser.add_argument('--episodes', type=int, default=2000,
+    parser.add_argument('--episodes', type=int, default=3000,
                         help='Total training episodes')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor')
     parser.add_argument('--lr', type=float, default=None,
                         help='Actor learning rate (default: 3e-4 for ac_mc/ac_td, 1e-3 for REINFORCE variants)')
-    parser.add_argument('--critic-lr', type=float, default=3e-3,
+    parser.add_argument('--critic-lr', type=float, default=1e-3,
                         help='Critic learning rate (AC variants only)')
     parser.add_argument('--ema-alpha', type=float, default=0.05,
                         help='EMA smoothing factor for reinforce_ema baseline')
@@ -76,9 +183,9 @@ def main():
                         help='Constant baseline value for reinforce_fixed')
     parser.add_argument('--seed', type=int, default=1,
                         help='Random seed')
-    parser.add_argument('--print-every', type=int, default=20,
+    parser.add_argument('--print-every', type=int, default=50,
                         help='Console print interval (episodes)')
-    parser.add_argument('--eval-every', type=int, default=100,
+    parser.add_argument('--eval-every', type=int, default=50,
                         help='Evaluation interval (episodes)')
     parser.add_argument('--eval-episodes', type=int, default=10,
                         help='Number of evaluation episodes')
@@ -87,6 +194,18 @@ def main():
                         help='Base output directory (default: part1/results/)')
     parser.add_argument('--update-every', type=int, default=1,
                         help='Accumulate this many episodes before each gradient update (default: 1 = per-episode)')
+    parser.add_argument('--lr-schedule', type=str, default='none',
+                        choices=['none', 'linear', 'cosine'],
+                        help='Per-update LR schedule. "linear"/"cosine" decay to 10%% of initial '
+                             'LR over the run. Stepped per update (per-episode when '
+                             'update_every=1), so variable episode lengths consume the decay '
+                             'budget unevenly — caveat in writeup.')
+    parser.add_argument('--smooth-window', type=int, default=5,
+                        help='Checkpoint window for smoothed-best eval (also gates model_best.pt saves)')
+    parser.add_argument('--topk', type=int, default=5,
+                        help='K for top-K eval mean in summary.json')
+    parser.add_argument('--final-k', type=int, default=5,
+                        help='K trailing checkpoints averaged for final_eval_mean')
     parser.add_argument('--render', action='store_true',
                         help='Render training episodes')
     args = parser.parse_args()
@@ -96,8 +215,10 @@ def main():
         args.lr = 3e-4 if args.algorithm in ('ac_mc', 'ac_td') else 1e-3
 
     # ---- output directory ----
+    # Schedule tag is empty for 'none' so existing runs keep their layout.
+    schedule_tag = '' if args.lr_schedule == 'none' else f'_sched{args.lr_schedule}'
     out_dir = os.path.join(args.results_dir, args.algorithm,
-                           f'lr{args.lr}_upd{args.update_every}',
+                           f'lr{args.lr}_upd{args.update_every}{schedule_tag}',
                            f'seed_{args.seed}')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -126,10 +247,17 @@ def main():
                   ema_alpha=args.ema_alpha,
                   fixed_baseline=args.fixed_baseline)
 
+    # ---- LR schedulers (per-update; see --lr-schedule help for caveat) ----
+    num_updates = args.episodes // args.update_every
+    actor_scheduler, critic_scheduler = make_schedulers(
+        agent.actor_optimizer, agent.critic_optimizer,
+        args.lr_schedule, num_updates)
+
     # ---- CSV loggers ----
+    # actor_lr / critic_lr columns let you sanity-check the schedule from the log.
     log_fields = ['episode', 'return', 'length', 'wall_time', 'sigma_mean',
                   'actor_loss', 'critic_loss', 'baseline',
-                  'mean_value', 'mean_td_error']
+                  'mean_value', 'mean_td_error', 'actor_lr', 'critic_lr']
     log_file = open(os.path.join(out_dir, 'log.csv'), 'w', newline='')
     log_writer = csv.DictWriter(log_file, fieldnames=log_fields)
     log_writer.writeheader()
@@ -142,6 +270,14 @@ def main():
 
     # ---- training loop ----
     start_time = time.time()
+
+    # Best-checkpoint tracking: fire model_best.pt on the *smoothed* eval,
+    # not the raw max. A single 10-rollout eval can spike on noise alone;
+    # the moving-average max is a more defensible "best stable region" signal.
+    # Raw best, top-K, and final-K are still written to summary.json.
+    best_smoothed_eval = -float('inf')
+    eval_means_hist = []   # list of eval_mean values, in order
+    eval_eps_hist = []     # corresponding episode checkpoints
 
     for ep in range(1, args.episodes + 1):
         # Seed the env on the first episode for reproducibility;
@@ -171,9 +307,19 @@ def main():
             ep_length += 1
             done = terminated or truncated
 
+        # Read LR before the scheduler step so the logged value matches what
+        # was actually used in this episode's gradient update.
+        actor_lr = agent.actor_optimizer.param_groups[0]['lr']
+        critic_lr = (agent.critic_optimizer.param_groups[0]['lr']
+                     if agent.critic_optimizer is not None else None)
+
         # ---- end of episode: update policy every N episodes ----
         if ep % args.update_every == 0:
             metrics = agent.update_policy()
+            if actor_scheduler is not None:
+                actor_scheduler.step()
+            if critic_scheduler is not None:
+                critic_scheduler.step()
         else:
             metrics = {'actor_loss': None, 'critic_loss': None,
                        'baseline': None, 'mean_value': None, 'mean_td_error': None}
@@ -198,6 +344,8 @@ def main():
                            if metrics['mean_value'] is not None else ''),
             'mean_td_error': (round(metrics['mean_td_error'], 6)
                               if metrics['mean_td_error'] is not None else ''),
+            'actor_lr': round(actor_lr, 8),
+            'critic_lr': round(critic_lr, 8) if critic_lr is not None else '',
         }
         log_writer.writerow(row)
         log_file.flush()
@@ -222,8 +370,29 @@ def main():
                 'eval_mean_length': round(eval_len, 1),
             })
             eval_file.flush()
+            eval_means_hist.append(float(eval_mean))
+            eval_eps_hist.append(ep)
+
+            # Save model_best.pt when the smoothed eval signal sets a new high.
+            # For the first (smooth_window - 1) checkpoints _smoothed_eval_max
+            # falls back to raw max, so the trigger still fires early.
+            current_smoothed, _ = _smoothed_eval_max(
+                eval_means_hist, eval_eps_hist, window=args.smooth_window)
+            if current_smoothed is not None and current_smoothed > best_smoothed_eval:
+                best_smoothed_eval = current_smoothed
+                torch.save({
+                    'policy_state_dict': policy.state_dict(),
+                    'algorithm': args.algorithm,
+                    'episode': ep,
+                    'obs_dim': state_space,
+                    'act_dim': action_space,
+                    'smoothed_eval': round(current_smoothed, 2),
+                    'raw_eval': round(float(eval_mean), 2),
+                }, os.path.join(out_dir, 'model_best.pt'))
+
             print(f"       [Eval] Mean {eval_mean:>8.1f} ± {eval_std:.1f} | "
-                  f"Len {eval_len:.0f}")
+                  f"Len {eval_len:.0f} | "
+                  f"SmoothedBest {best_smoothed_eval:.1f}")
 
     # ---- save final model ----
     torch.save({
@@ -234,11 +403,32 @@ def main():
         'act_dim': action_space,
     }, os.path.join(out_dir, 'model.pt'))
 
+    # ---- per-seed summary (raw / smoothed / top-K / final-K) ----
+    # `best_eval_mean` is the raw max of 10-rollout eval means — positively
+    # biased by eval-noise; lead the writeup with `smoothed_best_eval` and
+    # `topk_eval_mean` instead. All four are written so you can compare.
+    seed_summary = write_seed_summary(
+        out_dir,
+        eval_means=eval_means_hist,
+        eval_eps=eval_eps_hist,
+        total_episodes=args.episodes,
+        wall_time_s=time.time() - start_time,
+        smooth_window=args.smooth_window,
+        topk=args.topk,
+        final_k=args.final_k,
+    )
+
     log_file.close()
     eval_file.close()
     env.close()
 
     print(f"\nTraining complete. Results saved to {out_dir}")
+    print(f"  smoothed_best_eval: {seed_summary.get('smoothed_best_eval')} "
+          f"at ep {seed_summary.get('smoothed_best_episode')}")
+    print(f"  best_eval (raw):    {seed_summary.get('best_eval_mean')} "
+          f"at ep {seed_summary.get('best_eval_episode')}")
+    print(f"  top-{args.topk} mean:         {seed_summary.get('topk_eval_mean')}")
+    print(f"  final-{args.final_k} mean:       {seed_summary.get('final_eval_mean')}")
 
 
 if __name__ == '__main__':
