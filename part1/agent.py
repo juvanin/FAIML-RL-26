@@ -4,13 +4,18 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 
 
-def discount_rewards(r, gamma):
+def discount_rewards(r, gamma, done=None):
     discounted_r = torch.zeros_like(r)
     running_add = 0
     for t in reversed(range(0, r.size(-1))):
+        if done is not None and done[t]:
+            running_add = 0
         running_add = running_add * gamma + r[t]
         discounted_r[t] = running_add
     return discounted_r
+
+
+VALID_ALGORITHMS = ['reinforce', 'reinforce_batch', 'reinforce_ema', 'reinforce_fixed', 'ac_mc', 'ac_td']
 
 
 class Policy(torch.nn.Module):
@@ -37,7 +42,9 @@ class Policy(torch.nn.Module):
         """
             Critic network
         """
-        # TASK 3: critic network for actor-critic algorithm
+        self.fc1_critic = torch.nn.Linear(state_space, self.hidden)
+        self.fc2_critic = torch.nn.Linear(self.hidden, self.hidden)
+        self.fc3_critic = torch.nn.Linear(self.hidden, 1)
 
 
         self.init_weights()
@@ -61,23 +68,60 @@ class Policy(torch.nn.Module):
         sigma = self.sigma_activation(self.sigma)
         normal_dist = Normal(action_mean, sigma)
 
-
-        """
-            Critic
-        """
-        # TASK 3: forward in the critic network
-
-        
         return normal_dist
 
 
+    def critic_forward(self, x):
+        """
+            Critic — separate from forward() to preserve get_action signature.
+        """
+        x_critic = self.tanh(self.fc1_critic(x))
+        x_critic = self.tanh(self.fc2_critic(x_critic))
+        value = self.fc3_critic(x_critic)
+        return value.squeeze(-1)
+
+
+    def actor_parameters(self):
+        """Return only the actor network parameters (including sigma)."""
+        return (list(self.fc1_actor.parameters()) +
+                list(self.fc2_actor.parameters()) +
+                list(self.fc3_actor_mean.parameters()) +
+                [self.sigma])
+
+    def critic_parameters(self):
+        """Return only the critic network parameters."""
+        return (list(self.fc1_critic.parameters()) +
+                list(self.fc2_critic.parameters()) +
+                list(self.fc3_critic.parameters()))
+
+
 class Agent(object):
-    def __init__(self, policy, device='cpu'):
+    def __init__(self, policy, algorithm='reinforce', device='cpu',
+                 lr=1e-3, critic_lr=1e-3, gamma=0.99, ema_alpha=0.05,
+                 fixed_baseline=20.0):
         self.train_device = device
         self.policy = policy.to(self.train_device)
-        self.optimizer = torch.optim.Adam(policy.parameters(), lr=1e-3)
 
-        self.gamma = 0.99
+        assert algorithm in VALID_ALGORITHMS, f"Unknown algorithm: {algorithm}"
+        self.algorithm = algorithm
+        self.gamma = gamma
+
+        # Actor optimizer — scoped to actor parameters only
+        self.actor_optimizer = torch.optim.Adam(policy.actor_parameters(), lr=lr)
+
+        # Critic optimizer — only for actor-critic variants
+        self.critic_optimizer = None
+        if algorithm in ('ac_mc', 'ac_td'):
+            self.critic_optimizer = torch.optim.Adam(
+                policy.critic_parameters(), lr=critic_lr)
+
+        # EMA baseline state (used only by reinforce_ema)
+        self.ema_baseline = 0.0
+        self.ema_alpha = ema_alpha
+
+        # Fixed baseline (used only by reinforce_fixed)
+        self.fixed_baseline = fixed_baseline
+
         self.states = []
         self.next_states = []
         self.action_log_probs = []
@@ -94,23 +138,175 @@ class Agent(object):
 
         self.states, self.next_states, self.action_log_probs, self.rewards, self.done = [], [], [], [], []
 
-        #
-        # TASK 2:
-        #   - compute discounted returns
-        #   - compute policy gradient loss function given actions and returns
-        #   - compute gradients and step the optimizer
-        #
+        # Dispatch to the appropriate variant
+        if self.algorithm == 'reinforce':
+            return self._update_reinforce(action_log_probs, rewards, done)
+        elif self.algorithm == 'reinforce_batch':
+            return self._update_reinforce_batch(action_log_probs, rewards, done)
+        elif self.algorithm == 'reinforce_ema':
+            return self._update_reinforce_ema(action_log_probs, rewards, done)
+        elif self.algorithm == 'reinforce_fixed':
+            return self._update_reinforce_fixed(action_log_probs, rewards, done)
+        elif self.algorithm == 'ac_mc':
+            return self._update_ac_mc(action_log_probs, states, rewards, done)
+        elif self.algorithm == 'ac_td':
+            return self._update_ac_td(action_log_probs, states, next_states,
+                                      rewards, done)
 
 
-        #
-        # TASK 3:
-        #   - compute boostrapped discounted return estimates
-        #   - compute advantage terms
-        #   - compute actor loss and critic loss
-        #   - compute gradients and step the optimizer
-        #
+    # ------------------------------------------------------------------
+    #  REINFORCE variants
+    # ------------------------------------------------------------------
 
-        return        
+    def _update_reinforce(self, action_log_probs, rewards, done):
+        """Vanilla REINFORCE — no baseline."""
+        G = discount_rewards(rewards, self.gamma, done)
+
+        # Policy gradient loss (negative sign: PyTorch minimises)
+        actor_loss = -(action_log_probs * G).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': None,
+            'baseline': None,
+            'mean_value': None,
+            'mean_td_error': None,
+        }
+
+
+    def _update_reinforce_batch(self, action_log_probs, rewards, done):
+        """REINFORCE + per-batch mean baseline."""
+        G = discount_rewards(rewards, self.gamma, done)
+        baseline = G.mean()
+        advantage = G - baseline
+
+        actor_loss = -(action_log_probs * advantage).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': None,
+            'baseline': baseline.item(),
+            'mean_value': None,
+            'mean_td_error': None,
+        }
+
+
+    def _update_reinforce_ema(self, action_log_probs, rewards, done):
+        """REINFORCE + EMA constant baseline (tracks discounted-return mean)."""
+        G = discount_rewards(rewards, self.gamma, done)
+
+        # Update EMA baseline with the mean of *discounted* returns
+        self.ema_baseline = ((1 - self.ema_alpha) * self.ema_baseline
+                             + self.ema_alpha * G.mean().item())
+
+        advantage = G - self.ema_baseline
+
+        actor_loss = -(action_log_probs * advantage).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': None,
+            'baseline': self.ema_baseline,
+            'mean_value': None,
+            'mean_td_error': None,
+        }
+
+    def _update_reinforce_fixed(self, action_log_probs, rewards, done):
+        """REINFORCE + constant baseline (set once at construction)."""
+        G = discount_rewards(rewards, self.gamma, done)
+        advantage = G - self.fixed_baseline
+
+        actor_loss = -(action_log_probs * advantage).mean()
+
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': None,
+            'baseline': self.fixed_baseline,
+            'mean_value': None,
+            'mean_td_error': None,
+        }
+
+    # ------------------------------------------------------------------
+    #  Actor-Critic variants
+    # ------------------------------------------------------------------
+
+    def _update_ac_mc(self, action_log_probs, states, rewards, done):
+        """Actor-Critic with Monte-Carlo return as critic target."""
+        G = discount_rewards(rewards, self.gamma, done)
+        values = self.policy.critic_forward(states)
+
+        # Advantage — detach so actor update only touches actor params
+        advantage = (G - values).detach()
+
+        # Critic update: push V(s) toward Monte-Carlo return G
+        critic_loss = F.mse_loss(values, G)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Actor update
+        actor_loss = -(action_log_probs * advantage).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': critic_loss.item(),
+            'baseline': None,
+            'mean_value': values.mean().item(),
+            'mean_td_error': None,
+        }
+
+
+    def _update_ac_td(self, action_log_probs, states, next_states,
+                      rewards, done):
+        """Actor-Critic with bootstrapped TD target."""
+        values = self.policy.critic_forward(states)
+        next_values = self.policy.critic_forward(next_states)
+
+        # TD target — next_values detached so gradients don't flow through
+        # both sides of the MSE (constraint #8)
+        td_target = rewards + self.gamma * next_values.detach() * (1 - done)
+
+        # Advantage — detach so actor update only touches actor params
+        advantage = (td_target - values).detach()
+
+        # Critic update: push V(s) toward TD target
+        critic_loss = F.mse_loss(values, td_target)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Actor update
+        actor_loss = -(action_log_probs * advantage).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        return {
+            'actor_loss': actor_loss.item(),
+            'critic_loss': critic_loss.item(),
+            'baseline': None,
+            'mean_value': values.mean().item(),
+            'mean_td_error': advantage.mean().item(),
+        }
 
 
     def get_action(self, state, evaluation=False):
@@ -137,4 +333,3 @@ class Agent(object):
         self.action_log_probs.append(action_log_prob)
         self.rewards.append(torch.Tensor([reward]))
         self.done.append(done)
-
