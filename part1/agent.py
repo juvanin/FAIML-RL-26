@@ -4,10 +4,12 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 
 
-def discount_rewards(r, gamma):
+def discount_rewards(r, gamma, done=None):
     discounted_r = torch.zeros_like(r)
     running_add = 0
     for t in reversed(range(0, r.size(-1))):
+        if done is not None and done[t]:
+            running_add = 0
         running_add = running_add * gamma + r[t]
         discounted_r[t] = running_add
     return discounted_r
@@ -138,15 +140,15 @@ class Agent(object):
 
         # Dispatch to the appropriate variant
         if self.algorithm == 'reinforce':
-            return self._update_reinforce(action_log_probs, rewards)
+            return self._update_reinforce(action_log_probs, rewards, done)
         elif self.algorithm == 'reinforce_batch':
-            return self._update_reinforce_batch(action_log_probs, rewards)
+            return self._update_reinforce_batch(action_log_probs, rewards, done)
         elif self.algorithm == 'reinforce_ema':
-            return self._update_reinforce_ema(action_log_probs, rewards)
+            return self._update_reinforce_ema(action_log_probs, rewards, done)
         elif self.algorithm == 'reinforce_fixed':
-            return self._update_reinforce_fixed(action_log_probs, rewards)
+            return self._update_reinforce_fixed(action_log_probs, rewards, done)
         elif self.algorithm == 'ac_mc':
-            return self._update_ac_mc(action_log_probs, states, rewards)
+            return self._update_ac_mc(action_log_probs, states, rewards, done)
         elif self.algorithm == 'ac_td':
             return self._update_ac_td(action_log_probs, states, next_states,
                                       rewards, done)
@@ -156,9 +158,9 @@ class Agent(object):
     #  REINFORCE variants
     # ------------------------------------------------------------------
 
-    def _update_reinforce(self, action_log_probs, rewards):
+    def _update_reinforce(self, action_log_probs, rewards, done):
         """Vanilla REINFORCE — no baseline."""
-        G = discount_rewards(rewards, self.gamma)
+        G = discount_rewards(rewards, self.gamma, done)
 
         # Policy gradient loss (negative sign: PyTorch minimises)
         actor_loss = -(action_log_probs * G).mean()
@@ -176,9 +178,9 @@ class Agent(object):
         }
 
 
-    def _update_reinforce_batch(self, action_log_probs, rewards):
+    def _update_reinforce_batch(self, action_log_probs, rewards, done):
         """REINFORCE + per-batch mean baseline."""
-        G = discount_rewards(rewards, self.gamma)
+        G = discount_rewards(rewards, self.gamma, done)
         baseline = G.mean()
         advantage = G - baseline
 
@@ -197,9 +199,9 @@ class Agent(object):
         }
 
 
-    def _update_reinforce_ema(self, action_log_probs, rewards):
+    def _update_reinforce_ema(self, action_log_probs, rewards, done):
         """REINFORCE + EMA constant baseline (tracks discounted-return mean)."""
-        G = discount_rewards(rewards, self.gamma)
+        G = discount_rewards(rewards, self.gamma, done)
 
         # Update EMA baseline with the mean of *discounted* returns
         self.ema_baseline = ((1 - self.ema_alpha) * self.ema_baseline
@@ -221,9 +223,9 @@ class Agent(object):
             'mean_td_error': None,
         }
 
-    def _update_reinforce_fixed(self, action_log_probs, rewards):
+    def _update_reinforce_fixed(self, action_log_probs, rewards, done):
         """REINFORCE + constant baseline (set once at construction)."""
-        G = discount_rewards(rewards, self.gamma)
+        G = discount_rewards(rewards, self.gamma, done)
         advantage = G - self.fixed_baseline
 
         actor_loss = -(action_log_probs * advantage).mean()
@@ -244,9 +246,9 @@ class Agent(object):
     #  Actor-Critic variants
     # ------------------------------------------------------------------
 
-    def _update_ac_mc(self, action_log_probs, states, rewards):
+    def _update_ac_mc(self, action_log_probs, states, rewards, done):
         """Actor-Critic with Monte-Carlo return as critic target."""
-        G = discount_rewards(rewards, self.gamma)
+        G = discount_rewards(rewards, self.gamma, done)
         values = self.policy.critic_forward(states)
 
         # Advantage — detach so actor update only touches actor params

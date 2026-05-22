@@ -66,8 +66,8 @@ def main():
                         help='Total training episodes')
     parser.add_argument('--gamma', type=float, default=0.99,
                         help='Discount factor')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Actor learning rate')
+    parser.add_argument('--lr', type=float, default=None,
+                        help='Actor learning rate (default: 3e-4 for ac_mc/ac_td, 1e-3 for REINFORCE variants)')
     parser.add_argument('--critic-lr', type=float, default=1e-3,
                         help='Critic learning rate (AC variants only)')
     parser.add_argument('--ema-alpha', type=float, default=0.05,
@@ -82,14 +82,22 @@ def main():
                         help='Evaluation interval (episodes)')
     parser.add_argument('--eval-episodes', type=int, default=10,
                         help='Number of evaluation episodes')
-    parser.add_argument('--results-dir', type=str, default='results',
-                        help='Base output directory')
+    _default_results = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'results')
+    parser.add_argument('--results-dir', type=str, default=_default_results,
+                        help='Base output directory (default: part1/results/)')
+    parser.add_argument('--update-every', type=int, default=1,
+                        help='Accumulate this many episodes before each gradient update (default: 1 = per-episode)')
     parser.add_argument('--render', action='store_true',
                         help='Render training episodes')
     args = parser.parse_args()
 
+    # Apply algorithm-specific LR default when not explicitly passed
+    if args.lr is None:
+        args.lr = 3e-4 if args.algorithm in ('ac_mc', 'ac_td') else 1e-3
+
     # ---- output directory ----
     out_dir = os.path.join(args.results_dir, args.algorithm,
+                           f'lr{args.lr}_upd{args.update_every}',
                            f'seed_{args.seed}')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -161,8 +169,12 @@ def main():
             ep_length += 1
             done = terminated or truncated
 
-        # ---- end of episode: update policy ----
-        metrics = agent.update_policy()
+        # ---- end of episode: update policy every N episodes ----
+        if ep % args.update_every == 0:
+            metrics = agent.update_policy()
+        else:
+            metrics = {'actor_loss': None, 'critic_loss': None,
+                       'baseline': None, 'mean_value': None, 'mean_td_error': None}
 
         sigma_mean = F.softplus(policy.sigma).mean().item()
         wall_time = time.time() - start_time
