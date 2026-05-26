@@ -11,3 +11,14 @@ part1/results/plots/
 .claude/
 CLAUDE.md
 docs/superpowers/
+
+# Ignora gli ambienti virtuali
+part2/faiml_env/
+faiml_env/
+venv/
+env/
+
+# Ignora i file di cache di Python
+__pycache__/
+*.pyc
+
